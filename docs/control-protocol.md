@@ -91,3 +91,13 @@ lightcraft-cli snapshot --library DIR --script tour.jsonl -o shot.png
   renders are in flight. Each request runs frames until it is answered and its injected input
   (clicks, keys, drags) has played out. Widget ids for `ui.clickWidget` come from `ui.widgets`
   (e.g. `button:upright-auto`). A 1600×1000 demo snapshot takes ~1–2 s (debug build).
+
+## Embedded session (no window)
+
+`lightcraft-cli embed --control PORT [--library DIR] [--size WxH] [--scale S]` runs a live app
+session with no window at all, for hosts that show LightCraft inside their own UI (Creative
+Suite). The UI is drawn by the CPU renderer above at its own frame pace (about 30 fps while
+something moves), and the same JSON-lines protocol is served on `127.0.0.1:PORT`: `ui.screenshot`
+returns its frames, `ui.click` / `ui.key` / `ui.text` / `ui.resize` drive it, `app.quit` ends it.
+Nothing appears on the screen and nothing takes focus, on any system. Requests are validated as
+for the desktop app (a line that isn't a request closes its connection).

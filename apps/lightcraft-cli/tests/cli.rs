@@ -336,3 +336,49 @@ fn connect_failure_hint_names_the_attempted_port() {
     assert!(err.contains("--control 18437"), "the hint must name the port it tried: {err}");
     assert!(!err.contains("--control 7980"), "{err}");
 }
+
+#[test]
+fn embed_serves_a_windowless_session_over_the_control_channel() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let lib = tmp("embed-lib");
+    let mut child = Command::new(BIN)
+        .args(["embed", "--control", &port.to_string(), "--library", lib.to_str().unwrap(), "--size", "800x500"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) if start.elapsed() < std::time::Duration::from_secs(60) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => panic!("embed never listened: {e}"),
+        }
+    };
+    let mut out = stream.try_clone().unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    let mut send = |line: String| -> Value {
+        writeln!(out, "{line}").unwrap();
+        serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap()
+    };
+    let mut call = |method: &str, params: Value| send(json!({"id": 7, "method": method, "params": params}).to_string());
+    let shot = tmp("embed.png");
+    let r = call("ui.screenshot", json!({"path": shot.to_str().unwrap()}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["id"], 7);
+    assert_eq!((r["result"]["width"].as_u64(), r["result"]["height"].as_u64()), (Some(800), Some(500)));
+    assert!(std::fs::metadata(&shot).unwrap().len() > 1000);
+    assert_eq!(call("ui.inspect", json!({}))["ok"], true);
+    // Junk is refused and the connection closed; the session keeps running for others.
+    let r = send("GET / HTTP/1.1".into());
+    assert_eq!(r["ok"], false, "{r}");
+    let mut s2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    writeln!(s2, "{}", json!({"id": 1, "method": "app.quit"})).unwrap();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(90), "app.quit didn't end the session");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(status.success());
+}

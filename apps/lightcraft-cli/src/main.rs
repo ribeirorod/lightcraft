@@ -62,6 +62,8 @@ USAGE:
                              string), e.g. --opt colorSpace=displayP3 --opt bitDepth=16
                              --opt percent=50 --opt shortEdge=1080 --opt ppi=300
                              --opt format=original (copy + XMP sidecar) --opt metadata=none
+  lightcraft-cli embed --control PORT [--library DIR] [--size WxH] [--scale S]
+      A live app session with no window, serving the control channel (for hosts such as Creative Suite).
   lightcraft-cli snapshot [OPTIONS] [FILES/FOLDERS…]
       Run the full app UI headlessly (no window, no GPU: CPU-rasterized egui) and write PNGs.
       Options:
@@ -128,6 +130,7 @@ fn main() -> ExitCode {
         Some("mcp") => mcp(&args[1..]),
         Some("render") => render(&args[1..]),
         Some("snapshot") => snapshot(&args[1..]),
+        Some("embed") => embed(&args[1..]),
         Some("commands") => commands(&args[1..]),
         Some("merge") => merge(&args[1..]),
         Some("synth-merge") => synth_merge(&args[1..]),
@@ -823,6 +826,136 @@ fn snapshot(args: &[String]) -> Result<(), String> {
         }
     }
     eprintln!("lightcraft-cli snapshot: done in {:.2} s ({} frames)", t0.elapsed().as_secs_f64(), h.frames());
+    Ok(())
+}
+
+/// `lightcraft-cli embed --control PORT [--library DIR] [--size WxH] [--scale S]`: a live app
+/// session with no window, for hosts that show the app inside their own UI (Creative Suite). The
+/// UI runs on the CPU renderer ([`Headless`]) at its own frame pace and answers the same JSON-lines
+/// control protocol as `lightcraft --control` on `127.0.0.1:PORT`: screenshots are its frames,
+/// input arrives as `ui.*` requests. Nothing appears on the screen and nothing takes focus.
+fn embed(args: &[String]) -> Result<(), String> {
+    use lightcraft_ui_egui::headless::Headless;
+    use std::io::{BufRead, Read};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    /// Longest request line accepted.
+    const MAX_LINE: u64 = 4 * 1024 * 1024;
+    let mut library: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut size = [1440.0f32, 900.0];
+    let mut scale = 1.0f32;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--control" => port = Some(take_value(args, &mut i, "--control")?.parse().map_err(|_| "--control expects a port")?),
+            "--library" => library = Some(take_value(args, &mut i, "--library")?.to_string()),
+            "--size" => {
+                let v = take_value(args, &mut i, "--size")?;
+                let (w, h) = v.split_once(['x', 'X']).ok_or("--size expects WxH, e.g. 1440x900")?;
+                size = [w.trim().parse().map_err(|_| "--size: bad width")?, h.trim().parse().map_err(|_| "--size: bad height")?];
+            }
+            "--scale" => scale = take_value(args, &mut i, "--scale")?.parse().map_err(|_| "--scale expects a number")?,
+            a => return Err(format!("unknown option `{a}`")),
+        }
+        i += 1;
+    }
+    let port = port.ok_or("embed: give --control PORT")?;
+    if !(scale.is_finite() && scale > 0.0 && size[0] >= 64.0 && size[1] >= 64.0 && size[0] <= 8192.0 && size[1] <= 8192.0) {
+        return Err("embed: bad --size/--scale".into());
+    }
+    let session = match &library {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+            let mut s = Session::new().with_fs();
+            s.open_library(dir, false).map_err(|e| library_error(dir, e))?;
+            s
+        }
+        None => Session::new().with_fs(),
+    };
+    let services = lightcraft_ui_egui::Services {
+        write_shared: Some(std::sync::Arc::new(lightcraft_engine::export::write_file)),
+        write: Some(Box::new(lightcraft_engine::export::write_file)),
+        png: Some(Box::new(|img: &lightcraft_raster::Rgba8| {
+            lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(img), &lightcraft_codecs::EncodeMeta::default()).unwrap_or_default()
+        })),
+        ..Default::default()
+    };
+    let app = lightcraft_ui_egui::LightcraftApp::new(session, services);
+    let mut h = Headless::new(app, size, scale);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("127.0.0.1:{port}: {e}"))?;
+    eprintln!("lightcraft-cli embed: control channel on 127.0.0.1:{port}");
+    // Connections are read on their own threads; the session answers on this one, between frames.
+    type Request = (String, Value, mpsc::Sender<Value>);
+    let (tx, rx) = mpsc::channel::<Request>();
+    std::thread::Builder::new()
+        .name("embed-accept".into())
+        .spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let tx = tx.clone();
+                let _ = std::thread::Builder::new().name("embed-conn".into()).spawn(move || {
+                    let Ok(read_half) = conn.try_clone() else { return };
+                    let mut reader = BufReader::new(read_half);
+                    let mut out = conn;
+                    loop {
+                        let mut line = Vec::new();
+                        match reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut line) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let text = String::from_utf8_lossy(&line);
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        // Only requests: anything else closes the connection (as the app's own server does).
+                        let Some(msg) = serde_json::from_str::<Value>(text.trim()).ok().filter(|m| m.get("method").and_then(Value::as_str).is_some())
+                        else {
+                            let _ = writeln!(out, "{}", json!({"ok": false, "error": "not a request; closing the connection"}));
+                            return;
+                        };
+                        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                        let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+                        let params = msg.get("params").cloned().unwrap_or(json!({}));
+                        let (rtx, rrx) = mpsc::channel();
+                        if tx.send((method, params, rtx)).is_err() {
+                            return;
+                        }
+                        let mut reply = rrx.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|_| json!({"ok": false, "error": "timed out"}));
+                        if let Some(o) = reply.as_object_mut() {
+                            o.insert("id".into(), id);
+                        }
+                        if writeln!(out, "{reply}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let timeout = Duration::from_secs(60);
+    loop {
+        let start = Instant::now();
+        while let Ok((method, params, reply)) = rx.try_recv() {
+            let r = h.request(&method, params, timeout);
+            let _ = reply.send(r); // the client may have gone away
+        }
+        if h.quit_requested() {
+            break;
+        }
+        h.step();
+        // ~30 frames a second while something moves, a few when idle.
+        let frame = if h.busy() { Duration::from_millis(33) } else { Duration::from_millis(100) };
+        if let Some(rest) = frame.checked_sub(start.elapsed()) {
+            match rx.recv_timeout(rest) {
+                Ok((method, params, reply)) => {
+                    let r = h.request(&method, params, timeout);
+                    let _ = reply.send(r);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
     Ok(())
 }
 
